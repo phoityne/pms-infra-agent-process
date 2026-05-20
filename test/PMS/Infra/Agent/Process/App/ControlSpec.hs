@@ -10,7 +10,6 @@ import qualified Control.Concurrent.STM as STM
 import Control.Lens
 import Data.Default
 import Data.Aeson (encode)
-import qualified Data.ByteString.Lazy.Char8 as BL
 
 import qualified PMS.Domain.Model.DM.Type as DM
 import qualified PMS.Infra.Agent.Process.App.Control as SUT
@@ -20,7 +19,6 @@ import qualified PMS.Infra.Agent.Process.DM.Type as SUT
 --
 data SpecContext = SpecContext {
                    _domainDataSpecContext :: DM.DomainData
-                 , _appDataSpecContext    :: SUT.AppData
                  , _threadIdSpecContext   :: Maybe (Async ())
                  }
 
@@ -29,10 +27,8 @@ makeLenses ''SpecContext
 defaultSpecContext :: IO SpecContext
 defaultSpecContext = do
   domDat <- DM.defaultDomainData
-  appDat <- SUT.defaultAppData
   return SpecContext {
            _domainDataSpecContext = domDat
-         , _appDataSpecContext    = appDat
          , _threadIdSpecContext   = Nothing
          }
 
@@ -72,7 +68,6 @@ setUp ctx = do
   thId   <- async $ SUT.runWithAppData appDat domDat'
   return ctx {
                _domainDataSpecContext = domDat'
-             , _appDataSpecContext    = appDat
              , _threadIdSpecContext   = Just thId
              }
 
@@ -87,7 +82,6 @@ setUpWithAllowList ctx allowList = do
   thId   <- async $ SUT.runWithAppData appDat domDat'
   return ctx {
                _domainDataSpecContext = domDat'
-             , _appDataSpecContext    = appDat
              , _threadIdSpecContext   = Just thId
              }
 
@@ -144,12 +138,20 @@ mkReadArgs size =
     { SUT._argumentsProcIntToolParams = size }
 
 -- |
--- Encode ProcStringToolParams (write payload) to RawJsonByteString.
+-- Encode ProcWriteToolParams (write payload) to RawJsonByteString.
 --
 mkWriteArgs :: String -> DM.RawJsonByteString
-mkWriteArgs s =
-  DM.RawJsonByteString $ encode $ SUT.ProcStringToolParams
-    { SUT._argumentsProcStringToolParams = s }
+mkWriteArgs s = mkWriteArgsWithAppendNewline s Nothing
+
+-- |
+-- Encode ProcWriteToolParams with explicit appendNewline.
+--
+mkWriteArgsWithAppendNewline :: String -> Maybe Bool -> DM.RawJsonByteString
+mkWriteArgsWithAppendNewline s appendNewline =
+  DM.RawJsonByteString $ encode $ SUT.ProcWriteToolParams
+    { SUT._dataProcWriteToolParams          = s
+    , SUT._appendNewlineProcWriteToolParams = appendNewline
+    }
 
 -- |
 -- Extract the isError flag from a response.
@@ -157,6 +159,25 @@ mkWriteArgs s =
 isError :: DM.McpToolsCallResponseData -> Bool
 isError dat =
   dat^.DM.resultMcpToolsCallResponseData^.DM.isErrorMcpToolsCallResponseResult
+
+-- |
+-- Extract the first text content from a response.
+--
+firstContentText :: DM.McpToolsCallResponseData -> String
+firstContentText dat =
+  let contents = dat^.DM.resultMcpToolsCallResponseData^.DM.contentMcpToolsCallResponseResult
+  in DM._textMcpToolsCallResponseResultContent (head contents)
+
+-- |
+-- Terminate the running process via agent-proc-terminate.
+--
+terminateProc :: DM.DomainData -> IO ()
+terminateProc domDat = do
+  _ <- sendAndReceive domDat $
+    DM.AgentProcessTerminateCommand $ DM.AgentProcessTerminateCommandData
+      { DM._jsonrpcAgentProcessTerminateCommandData = mkJsonRpc "agent-proc-terminate"
+      }
+  return ()
 
 -- ---------------------------------------------------------------------------
 -- Test suite
@@ -283,10 +304,7 @@ run = do
         runDat <- sendAndReceive domDat runCmd
         isError runDat `shouldBe` False
         -- cleanup
-        let termCmd = DM.AgentProcessTerminateCommand $ DM.AgentProcessTerminateCommandData
-                        { DM._jsonrpcAgentProcessTerminateCommandData = mkJsonRpc "agent-proc-terminate"
-                        }
-        _ <- sendAndReceive domDat termCmd
+        terminateProc domDat
         tearDown ctx'
 
   -- TC-06: Whitelist - denied command returns error message
@@ -325,4 +343,173 @@ run = do
         let contents = runDat^.DM.resultMcpToolsCallResponseData^.DM.contentMcpToolsCallResponseResult
             errText  = DM._textMcpToolsCallResponseResultContent (head contents)
         errText `shouldBe` "cmd2task: exception occurred. skip. command not allowed: cmd.exe"
+        tearDown ctx'
+
+  -- ---------------------------------------------------------------------------
+  -- CR-11: appendNewline tests
+  -- ---------------------------------------------------------------------------
+
+  -- TC-A: appendNewline omitted -> newline is appended and cmd.exe executes input
+  describe "TC-A: agent-proc-write appendNewline default appends newline" $ do
+    context "when appendNewline is omitted and input has no trailing newline" $ do
+      it "should execute the command because newline is appended" $ \ctx -> do
+        putStrLn "[INFO] TC-A start."
+        let domDat = ctx^.domainDataSpecContext
+            token  = "pms-cr11-default-newline"
+
+        let runCmd = DM.AgentProcessRunCommand $ DM.AgentProcessRunCommandData
+                       { DM._jsonrpcAgentProcessRunCommandData   = mkJsonRpc "agent-proc-run"
+                       , DM._nameAgentProcessRunCommandData      = "agent-proc-run"
+                       , DM._argumentsAgentProcessRunCommandData = mkRunArgs "cmd.exe" []
+                       }
+        runDat <- sendAndReceive domDat runCmd
+        isError runDat `shouldBe` False
+
+        threadDelay (500 * 1000)
+        let readCmd = DM.AgentProcessReadCommand $ DM.AgentProcessReadCommandData
+                        { DM._jsonrpcAgentProcessReadCommandData   = mkJsonRpc "agent-proc-read"
+                        , DM._argumentsAgentProcessReadCommandData = mkReadArgs 4096
+                        }
+        _ <- sendAndReceive domDat readCmd
+
+        let writeCmd = DM.AgentProcessWriteCommand $ DM.AgentProcessWriteCommandData
+                         { DM._jsonrpcAgentProcessWriteCommandData   = mkJsonRpc "agent-proc-write"
+                         , DM._argumentsAgentProcessWriteCommandData = mkWriteArgs ("echo " ++ token)
+                         }
+        writeDat <- sendAndReceive domDat writeCmd
+        isError writeDat `shouldBe` False
+
+        threadDelay (500 * 1000)
+        readDat <- sendAndReceive domDat readCmd
+        isError readDat `shouldBe` False
+        firstContentText readDat `shouldContain` token
+
+        terminateProc domDat
+
+  -- TC-B: appendNewline False -> no newline is appended and cmd.exe keeps input pending
+  describe "TC-B: agent-proc-write appendNewline=False suppresses newline" $ do
+    context "when appendNewline is Just False" $ do
+      it "should not execute the command because newline is not appended" $ \ctx -> do
+        putStrLn "[INFO] TC-B start."
+        let domDat = ctx^.domainDataSpecContext
+            token  = "pms-cr11-no-newline"
+
+        let runCmd = DM.AgentProcessRunCommand $ DM.AgentProcessRunCommandData
+                       { DM._jsonrpcAgentProcessRunCommandData   = mkJsonRpc "agent-proc-run"
+                       , DM._nameAgentProcessRunCommandData      = "agent-proc-run"
+                       , DM._argumentsAgentProcessRunCommandData = mkRunArgs "cmd.exe" []
+                       }
+        runDat <- sendAndReceive domDat runCmd
+        isError runDat `shouldBe` False
+
+        threadDelay (500 * 1000)
+        let readCmd = DM.AgentProcessReadCommand $ DM.AgentProcessReadCommandData
+                        { DM._jsonrpcAgentProcessReadCommandData   = mkJsonRpc "agent-proc-read"
+                        , DM._argumentsAgentProcessReadCommandData = mkReadArgs 4096
+                        }
+        _ <- sendAndReceive domDat readCmd
+
+        let writeCmd = DM.AgentProcessWriteCommand $ DM.AgentProcessWriteCommandData
+                         { DM._jsonrpcAgentProcessWriteCommandData   = mkJsonRpc "agent-proc-write"
+                         , DM._argumentsAgentProcessWriteCommandData =
+                             mkWriteArgsWithAppendNewline ("echo " ++ token) (Just False)
+                         }
+        writeDat <- sendAndReceive domDat writeCmd
+        isError writeDat `shouldBe` False
+
+        threadDelay (500 * 1000)
+        readDat <- sendAndReceive domDat readCmd
+        isError readDat `shouldBe` False
+        firstContentText readDat `shouldNotContain` token
+
+        terminateProc domDat
+
+  -- ---------------------------------------------------------------------------
+  -- CR-12: invalidPatterns tests
+  -- ---------------------------------------------------------------------------
+
+  -- TC-08: invalidPatterns - matching input -> isError=True
+  describe "TC-08: invalidPatterns - matching input is rejected" $ do
+    context "when agent-proc-write input matches an invalidPatterns entry" $ do
+      it "should return isError=True" $ \ctx -> do
+        putStrLn "[INFO] TC-08 start."
+        domDat <- DM.defaultDomainData
+        let domDat' = domDat
+              { DM._allowedAgentCmdsDomainData  = ["cmd.exe"]
+              , DM._invalidPatternsDomainData   = ["rm", "shutdown"]
+              }
+        appDat <- SUT.defaultAppData
+        thId   <- async $ SUT.runWithAppData appDat domDat'
+        let ctx' = ctx { _domainDataSpecContext = domDat'
+                       , _threadIdSpecContext   = Just thId
+                       }
+        dat <- sendAndReceive domDat' $
+          DM.AgentProcessWriteCommand $ DM.AgentProcessWriteCommandData
+            { DM._jsonrpcAgentProcessWriteCommandData   = mkJsonRpc "agent-proc-write"
+            , DM._argumentsAgentProcessWriteCommandData = mkWriteArgs "rm -rf /"
+            }
+        isError dat `shouldBe` True
+        -- No process was started, just cancel the SUT thread.
+        tearDown ctx'
+
+  -- TC-09: invalidPatterns - non-matching input -> normal processing
+  describe "TC-09: invalidPatterns - non-matching input is allowed" $ do
+    context "when agent-proc-write input does NOT match any invalidPatterns entry" $ do
+      it "should return isError=False when process is running" $ \ctx -> do
+        putStrLn "[INFO] TC-09 start."
+        domDat <- DM.defaultDomainData
+        let domDat' = domDat
+              { DM._allowedAgentCmdsDomainData  = ["cmd.exe"]
+              , DM._invalidPatternsDomainData   = ["rm", "shutdown"]
+              }
+        appDat <- SUT.defaultAppData
+        thId   <- async $ SUT.runWithAppData appDat domDat'
+        let ctx' = ctx { _domainDataSpecContext = domDat'
+                       , _threadIdSpecContext   = Just thId
+                       }
+        _ <- sendAndReceive domDat' $
+          DM.AgentProcessRunCommand $ DM.AgentProcessRunCommandData
+            { DM._jsonrpcAgentProcessRunCommandData   = mkJsonRpc "agent-proc-run"
+            , DM._nameAgentProcessRunCommandData      = "agent-proc-run"
+            , DM._argumentsAgentProcessRunCommandData = mkRunArgs "cmd.exe" []
+            }
+        dat <- sendAndReceive domDat' $
+          DM.AgentProcessWriteCommand $ DM.AgentProcessWriteCommandData
+            { DM._jsonrpcAgentProcessWriteCommandData   = mkJsonRpc "agent-proc-write"
+            , DM._argumentsAgentProcessWriteCommandData = mkWriteArgs "echo hello"
+            }
+        isError dat `shouldBe` False
+        -- cleanup: terminate cmd.exe before cancelling SUT thread
+        terminateProc domDat'
+        tearDown ctx'
+
+  -- TC-10: invalidPatterns - empty list -> allow all
+  describe "TC-10: invalidPatterns - empty list allows all input" $ do
+    context "when invalidPatterns is empty" $ do
+      it "should not reject any write input" $ \ctx -> do
+        putStrLn "[INFO] TC-10 start."
+        domDat <- DM.defaultDomainData
+        let domDat' = domDat
+              { DM._allowedAgentCmdsDomainData  = ["cmd.exe"]
+              , DM._invalidPatternsDomainData   = []
+              }
+        appDat <- SUT.defaultAppData
+        thId   <- async $ SUT.runWithAppData appDat domDat'
+        let ctx' = ctx { _domainDataSpecContext = domDat'
+                       , _threadIdSpecContext   = Just thId
+                       }
+        _ <- sendAndReceive domDat' $
+          DM.AgentProcessRunCommand $ DM.AgentProcessRunCommandData
+            { DM._jsonrpcAgentProcessRunCommandData   = mkJsonRpc "agent-proc-run"
+            , DM._nameAgentProcessRunCommandData      = "agent-proc-run"
+            , DM._argumentsAgentProcessRunCommandData = mkRunArgs "cmd.exe" []
+            }
+        dat <- sendAndReceive domDat' $
+          DM.AgentProcessWriteCommand $ DM.AgentProcessWriteCommandData
+            { DM._jsonrpcAgentProcessWriteCommandData   = mkJsonRpc "agent-proc-write"
+            , DM._argumentsAgentProcessWriteCommandData = mkWriteArgs "rm -rf /"
+            }
+        isError dat `shouldBe` False
+        -- cleanup: terminate cmd.exe before cancelling SUT thread
+        terminateProc domDat'
         tearDown ctx'

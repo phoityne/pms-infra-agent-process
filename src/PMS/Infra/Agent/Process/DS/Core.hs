@@ -18,13 +18,13 @@ import Control.Monad.Except
 import Control.Monad (when)
 import qualified Control.Exception.Safe as E
 import System.Exit
-import qualified Data.ByteString as BS
 import Data.Aeson
 import qualified System.Process as S
 import qualified Data.Map.Strict as Map
 
 import qualified PMS.Domain.Model.DM.Type as DM
 import qualified PMS.Domain.Model.DM.Constant as DM
+import qualified PMS.Domain.Model.DS.Utility as DM
 
 import PMS.Infra.Agent.Process.DM.Type
 import qualified PMS.Infra.Agent.Process.DM.Constant as DM_CONST
@@ -121,12 +121,12 @@ genEchoTask dat = do
 echoTask :: STM.TQueue DM.McpResponse -> DM.AgentProcessEchoCommandData -> String -> IOTask ()
 echoTask resQ cmdDat val = flip E.catchAny errHdl $ do
   hPutStrLn stderr $ "[INFO] PMS.Infra.Agent.Process.DS.Core.echoTask run. " ++ val
-  toolsCallResponse resQ (cmdDat^.DM.jsonrpcAgentProcessEchoCommandData) ExitSuccess val ""
+  DM.toolsCallResponse resQ (cmdDat^.DM.jsonrpcAgentProcessEchoCommandData) ExitSuccess val ""
   hPutStrLn stderr "[INFO] PMS.Infra.Agent.Process.DS.Core.echoTask end."
 
   where
     errHdl :: E.SomeException -> IO ()
-    errHdl e = toolsCallResponse resQ (cmdDat^.DM.jsonrpcAgentProcessEchoCommandData) (ExitFailure 1) "" (show e)
+    errHdl e = DM.toolsCallResponse resQ (cmdDat^.DM.jsonrpcAgentProcessEchoCommandData) (ExitFailure 1) "" (show e)
 
 
 ---------------------------------------------------------------------------------
@@ -164,13 +164,13 @@ procRunTask cmdDat resQ procTMVar cmd argsArray addEnv = flip E.catchAny errHdl 
     Just p -> do
       STM.atomically $ STM.putTMVar procTMVar (Just p)
       hPutStrLn stderr "[ERROR] PMS.Infra.Agent.Process.DS.Core.procRunTask: process is already running."
-      toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is already running."
+      DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is already running."
     Nothing -> do
       runProc procTMVar cmd argsArray addEnv
       let payload = "command: " ++ truncate10 cmd
                  ++ ", arguments: " ++ truncate10 (show argsArray)
                  ++ ", environment: " ++ truncate10 (show addEnv)
-      toolsCallResponse resQ jsonRpc ExitSuccess payload ""
+      DM.toolsCallResponse resQ jsonRpc ExitSuccess payload ""
   hPutStrLn stderr "[INFO] PMS.Infra.Agent.Process.DS.Core.procRunTask end."
   where
     jsonRpc = cmdDat^.DM.jsonrpcAgentProcessRunCommandData
@@ -178,7 +178,7 @@ procRunTask cmdDat resQ procTMVar cmd argsArray addEnv = flip E.catchAny errHdl 
     errHdl e = do
       _ <- STM.atomically $ STM.tryTakeTMVar procTMVar
       STM.atomically $ STM.putTMVar procTMVar Nothing
-      toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
+      DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
     -- |
     -- Truncate a string to at most 10 characters, appending "..." if truncated.
@@ -213,19 +213,19 @@ procTerminateTask cmdDat resQ procTMVar = flip E.catchAny errHdl $ do
   STM.atomically (STM.swapTMVar procTMVar Nothing) >>= \case
     Nothing -> do
       hPutStrLn stderr "[ERROR] PMS.Infra.Agent.Process.DS.Core.procTerminateTask: process is not started."
-      toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is not started."
+      DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is not started."
     Just procDat -> do
       let pHdl = procDat^.pHdlProcData
       S.terminateProcess pHdl
       exitCode <- S.waitForProcess pHdl
       hPutStrLn stderr $ "[INFO] PMS.Infra.Agent.Process.DS.Core.procTerminateTask closeProc : " ++ show exitCode
-      toolsCallResponse resQ jsonRpc ExitSuccess "" "process is terminated."
+      DM.toolsCallResponse resQ jsonRpc ExitSuccess "" "process is terminated."
 
   hPutStrLn stderr "[INFO] PMS.Infra.Agent.Process.DS.Core.procTerminateTask end."
 
   where
     errHdl :: E.SomeException -> IO ()
-    errHdl e = toolsCallResponse resQ (cmdDat^.DM.jsonrpcAgentProcessTerminateCommandData) (ExitFailure 1) "" (show e)
+    errHdl e = DM.toolsCallResponse resQ (cmdDat^.DM.jsonrpcAgentProcessTerminateCommandData) (ExitFailure 1) "" (show e)
 
 
 ---------------------------------------------------------------------------------
@@ -256,28 +256,36 @@ procReadTask cmdDat resQ procTMVar tout actualSize = flip E.catchAny errHdl $ do
   STM.atomically (STM.readTMVar procTMVar) >>= \case
     Nothing -> do
       hPutStrLn stderr "[ERROR] PMS.Infra.Agent.Process.DS.Core.procReadTask: process is not started."
-      toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is not started."
+      DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is not started."
     Just p -> do
-      output <- readProc p tout actualSize
-      let result = bs2strUTF8 output
-      toolsCallResponse resQ jsonRpc ExitSuccess result ""
+      output <- DM.readHandle (p^.rHdlProcData) tout actualSize
+      let result = DM.bs2strUTF8Strip output
+      DM.toolsCallResponse resQ jsonRpc ExitSuccess result ""
 
   where
     jsonRpc = cmdDat^.DM.jsonrpcAgentProcessReadCommandData
-    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
+    errHdl e = DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
 
 ---------------------------------------------------------------------------------
--- |
---
+-- | CR-12: agent-proc-write with invalidPatterns check.
+-- The invalidPatterns check is performed here in the gen function (AppContext),
+-- consistent with how genProcRunTask performs the allowedCmds check.
 genProcWriteTask :: DM.AgentProcessWriteCommandData -> AppContext (IOTask ())
 genProcWriteTask cmdData = do
   let argsBS = DM.unRawJsonByteString $ cmdData^.DM.argumentsAgentProcessWriteCommandData
-  resQ <- view DM.responseQueueDomainData <$> lift ask
-  procTMVar <- view processAppData <$> ask
-  argsDat <- liftEither $ eitherDecode $ argsBS
-  let args = argsDat^.argumentsProcStringToolParams
-  return $ procWriteTask cmdData resQ procTMVar args
+  resQ            <- view DM.responseQueueDomainData <$> lift ask
+  procTMVar       <- view processAppData <$> ask
+  invalidPatterns <- view DM.invalidPatternsDomainData <$> lift ask
+  argsDat         <- liftEither $ eitherDecode $ argsBS
+  let args          = argsDat^.dataProcWriteToolParams
+      appendNewline = argsDat^.appendNewlineProcWriteToolParams
+  -- CR-12: invalidPatterns check (pure check, consistent with genProcRunTask allowedCmds check)
+  case DM.checkInvalidPatterns invalidPatterns args of
+    Just pat -> throwError $
+      "agent-proc-write: rejected. input matches invalidPatterns: " ++ show pat
+    Nothing  -> return ()
+  return $ procWriteTask cmdData resQ procTMVar args appendNewline
 
 -- |
 --
@@ -285,22 +293,23 @@ procWriteTask :: DM.AgentProcessWriteCommandData
               -> STM.TQueue DM.McpResponse
               -> STM.TMVar (Maybe ProcData)
               -> String
+              -> Maybe Bool
               -> IOTask ()
-procWriteTask cmdDat resQ procTMVar args = flip E.catchAny errHdl $ do
+procWriteTask cmdDat resQ procTMVar args appendNewline = flip E.catchAny errHdl $ do
   hPutStrLn stderr $ "[INFO] PMS.Infra.Agent.Process.DS.Core.procWriteTask run. " ++ args
 
   STM.atomically (STM.readTMVar procTMVar) >>= \case
     Nothing -> do
       hPutStrLn stderr "[ERROR] PMS.Infra.Agent.Process.DS.Core.procWriteTask: process is not started."
-      toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is not started."
+      DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" "process is not started."
     Just p -> do
-      let wHdl = p^.wHdLProcData
-          cmd = str2bsUTF8 $ appendLF args
-      BS.hPut wHdl cmd
-      hFlush wHdl
-      toolsCallResponse resQ jsonRpc ExitSuccess "success" ""
+      -- Apply appendCRLF (auto-append newline) unless appendNewline is explicitly False.
+      let payload = if appendNewline == Just False
+                      then args
+                      else DM.appendCRLF args
+      DM.writeHandle (p^.wHdLProcData) (DM.str2bsUTF8 payload)
+      DM.toolsCallResponse resQ jsonRpc ExitSuccess "success" ""
 
   where
     jsonRpc = cmdDat^.DM.jsonrpcAgentProcessWriteCommandData
-    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
-
+    errHdl e = DM.toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)

@@ -89,17 +89,20 @@ instance Default ProcIntToolParams where
       }
 
 -- |
--- agent-proc-write の arguments
---
-data ProcStringToolParams =
-  ProcStringToolParams {
-    _argumentsProcStringToolParams :: String
+-- agent-proc-write data.
+-- appendNewline: Nothing or Just True (default) -> apply appendCRLF (auto-append newline).
+--               Just False -> send string as-is without any modification.
+data ProcWriteToolParams =
+  ProcWriteToolParams {
+    _dataProcWriteToolParams          :: String
+  , _appendNewlineProcWriteToolParams :: Maybe Bool
   } deriving (Show, Read, Eq)
 
-$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "ProcStringToolParams", omitNothingFields = True} ''ProcStringToolParams)
-makeLenses ''ProcStringToolParams
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "ProcWriteToolParams", omitNothingFields = True} ''ProcWriteToolParams)
+makeLenses ''ProcWriteToolParams
 
-instance Default ProcStringToolParams where
-  def = ProcStringToolParams {
-        _argumentsProcStringToolParams = def
+instance Default ProcWriteToolParams where
+  def = ProcWriteToolParams {
+        _dataProcWriteToolParams           = def
+      , _appendNewlineProcWriteToolParams  = def
       }
